@@ -24,7 +24,6 @@
 /* Third party libraries */
 #include "ws2812b.h"
 #include "ssd1306.h"
-#include "dht22.h"
 #include "bme280.h"
 
 /* USB CDC Debug */
@@ -138,7 +137,6 @@ void ProcessWebRequests(void);
 
 // 센서 함수들
 bool ReadBME280(SensorData_t *data);
-bool ReadDHT22(SensorData_t *data);
 
 // LED 제어 함수들
 void UpdateTemperatureLEDs(float temp);
@@ -210,10 +208,6 @@ int main(void)
     
     // USB CDC 디버깅 초기화
     Debug_Init();
-    
-    // DHT22 초기화
-    DHT22_Init(GPIOC, GPIO_PIN_13);
-    DEBUG_INFO("DHT22 initialized on PC13\r\n");
     
     // BME280 초기화
     HAL_Delay(100);
@@ -309,36 +303,17 @@ int main(void)
 void UpdateSensors(void)
 {
     SensorData_t newData = {0};
-    bool bmeSuccess = false;
-    bool dhtSuccess = false;
     
-    // BME280 읽기
-    bmeSuccess = ReadBME280(&newData);
-    if (bmeSuccess) {
-        DEBUG_LOG("BME280: T=%.1fC, H=%.1f%%\r\n", 
-                  newData.temperature, newData.humidity);
-    }
-    
-    if (bmeSuccess) {
-        // DHT22로 검증
-        SensorData_t dhtData = {0};
-        dhtSuccess = ReadDHT22(&dhtData);
-        
-        if (dhtSuccess) {
-            newData.temperature = (newData.temperature + dhtData.temperature) / 2.0f;
-            newData.humidity = (newData.humidity + dhtData.humidity) / 2.0f;
-        }
-    } else {
-        dhtSuccess = ReadDHT22(&newData);
-        newData.pressure = 0.0f;
-    }
-    
-    if (bmeSuccess || dhtSuccess) {
+    // BME280에서 온도, 습도, 압력 읽기
+    if (ReadBME280(&newData)) {
         newData.timestamp = GetTick();
         newData.valid = true;
         currentSensorData = newData;
+        DEBUG_LOG("BME280: T=%.1fC, H=%.1f%%, P=%.0fhPa\r\n", 
+                  newData.temperature, newData.humidity, newData.pressure/100.0f);
     } else {
         currentSensorData.valid = false;
+        DEBUG_WARN("BME280 read failed\r\n");
     }
 }
 
@@ -440,22 +415,6 @@ bool ReadBME280(SensorData_t *data)
         data->temperature = bmeData.temperature;
         data->humidity = bmeData.humidity;
         data->pressure = bmeData.pressure;
-        return true;
-    }
-    return false;
-}
-
-/**
-  * @brief  DHT22 센서 읽기
-  */
-bool ReadDHT22(SensorData_t *data)
-{
-    DHT22_Data_t dhtData;
-    
-    if (DHT22_Read(&dhtData) == DHT22_OK) {
-        data->temperature = dhtData.temperature;
-        data->humidity = dhtData.humidity;
-        data->pressure = 0.0f;
         return true;
     }
     return false;
