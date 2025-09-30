@@ -1,0 +1,967 @@
+/* STM32F411 IoT Dashboard - AT 명령어 방식 완성 코드
+ * ESP01을 AT 명령어로 직접 제어
+ * 
+ * 핀 구성:
+ * - 온도 LED: PB6 (TIM4_CH1) - WS2812B 5개
+ * - 습도 LED: PB0 (TIM3_CH3) - WS2812B 5개  
+ * - WiFi ESP01: PA2(TX), PA3(RX) - UART2
+ * - DHT22: PC13
+ * - OLED: PB8(SDA), PA8(SCL) - I2C1
+ * - SD Card: PB9(CS), PA7(MOSI), PB3(SCK), PA6(MISO) - SPI1
+ * - USB CDC: PA11(DM), PA12(DP) - 디버깅용
+ */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "fatfs.h"
+#include "usart.h"
+#include "i2c.h"
+#include "spi.h"
+#include "tim.h"
+#include "dma.h"
+#include "gpio.h"
+
+/* Third party libraries */
+#include "ws2812b.h"
+#include "ssd1306.h"
+#include "dht22.h"
+#include "bme280.h"
+
+/* USB CDC Debug */
+#include "usbd_cdc_if.h"
+#include "usb_device.h"
+
+/* Private includes ----------------------------------------------------------*/
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+#include <stdarg.h>
+
+/* Debug Configuration */
+#define DEBUG_ENABLE            1
+#define DEBUG_BUFFER_SIZE       512
+
+#define ESP01_DEBUG_ENABLE      1  // ESP01 디버깅 활성화
+
+/* Debug Levels */
+typedef enum {
+    DEBUG_LEVEL_ERROR = 0,
+    DEBUG_LEVEL_WARN = 1,
+    DEBUG_LEVEL_INFO = 2,
+    DEBUG_LEVEL_DEBUG = 3
+} debug_level_t;
+
+#define DEBUG_CURRENT_LEVEL     DEBUG_LEVEL_INFO
+
+/* Private typedef -----------------------------------------------------------*/
+typedef struct {
+    float temperature;
+    float humidity;
+    float pressure;
+    uint32_t timestamp;
+    bool valid;
+} SensorData_t;
+
+typedef enum {
+    ESP01_STATE_IDLE = 0,
+    ESP01_STATE_CONNECTING,
+    ESP01_STATE_CONNECTED,
+    ESP01_STATE_SERVER_READY,
+    ESP01_STATE_ERROR
+} ESP01_State_t;
+
+/* Private define ------------------------------------------------------------*/
+#define TEMP_LED_COUNT 5
+#define HUMIDITY_LED_COUNT 5
+#define SENSOR_UPDATE_INTERVAL 1000   // 1초
+#define DISPLAY_UPDATE_INTERVAL 2000  // 2초
+#define LED_UPDATE_INTERVAL 500       // 0.5초
+#define WIFI_CHECK_INTERVAL 10000     // 10초
+
+// ESP01 설정
+#define ESP01_BUFFER_SIZE       1024
+#define ESP01_SSID              "WeVO_2.4G"
+#define ESP01_PASSWORD          "WEVO8358"
+#define ESP01_SERVER_PORT       80
+
+/* Private variables ---------------------------------------------------------*/
+// 디버깅 관련
+static char debug_buffer[DEBUG_BUFFER_SIZE];
+static volatile bool usb_cdc_ready = false;
+
+// 센서 데이터
+SensorData_t currentSensorData = {0};
+bool ledState = false;
+
+// 타이밍 변수들
+uint32_t lastSensorUpdate = 0;
+uint32_t lastDisplayUpdate = 0;
+uint32_t lastLedUpdate = 0;
+uint32_t lastWiFiCheck = 0;
+
+// ESP01 상태
+ESP01_State_t esp01_state = ESP01_STATE_IDLE;
+bool server_active = false;
+
+// WS2812B LED 데이터
+ws2812b_led_t tempLeds[TEMP_LED_COUNT];
+ws2812b_led_t humidityLeds[HUMIDITY_LED_COUNT];
+
+// ESP01 수신 버퍼
+char esp01_rx_buffer[ESP01_BUFFER_SIZE];
+volatile uint16_t esp01_rx_index = 0;
+volatile bool esp01_response_received = false;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USB_DEVICE_Init(void);
+
+// 디버깅 함수들
+void Debug_Init(void);
+void Debug_Printf(debug_level_t level, const char* format, ...);
+int _write(int file, char *ptr, int len);
+
+// 메인 루프 함수들
+void UpdateSensors(void);
+void UpdateDisplay(void);
+void UpdateLEDs(void);
+void CheckWiFi(void);
+void ProcessWebRequests(void);
+
+// 센서 함수들
+bool ReadBME280(SensorData_t *data);
+bool ReadDHT22(SensorData_t *data);
+
+// LED 제어 함수들
+void UpdateTemperatureLEDs(float temp);
+void UpdateHumidityLEDs(float humidity);
+uint32_t TemperatureToColor(float temp);
+uint32_t HumidityToColor(float humidity);
+void SetLEDState(bool state);
+
+// ESP01 WiFi 함수들
+bool ESP01_Init(void);
+bool ESP01_ConnectWiFi(const char* ssid, const char* password);
+bool ESP01_StartServer(uint16_t port);
+bool ESP01_SendResponse(uint8_t link_id, const char* response);
+void ESP01_Process(void);
+ESP01_State_t ESP01_GetState(void);
+
+// ESP01 내부 함수들
+static bool ESP01_SendCommand(const char* cmd, const char* expected, uint32_t timeout);
+static bool ESP01_WaitForResponse(const char* expected, uint32_t timeout);
+static void ESP01_ClearBuffer(void);
+
+// OLED 디스플레이 함수들
+void DisplaySensorData(void);
+void DisplayInitScreen(void);
+
+// 유틸리티 함수들
+uint32_t GetTick(void);
+void Error_Handler(void);
+
+/* Debug Macros */
+#if DEBUG_ENABLE
+    #define DEBUG_ERROR(...)    Debug_Printf(DEBUG_LEVEL_ERROR, __VA_ARGS__)
+    #define DEBUG_WARN(...)     Debug_Printf(DEBUG_LEVEL_WARN, __VA_ARGS__)
+    #define DEBUG_INFO(...)     Debug_Printf(DEBUG_LEVEL_INFO, __VA_ARGS__)
+    #define DEBUG_LOG(...)      Debug_Printf(DEBUG_LEVEL_DEBUG, __VA_ARGS__)
+#else
+    #define DEBUG_ERROR(...)
+    #define DEBUG_WARN(...)
+    #define DEBUG_INFO(...)
+    #define DEBUG_LOG(...)
+#endif
+
+/* Private user code ---------------------------------------------------------*/
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+    /* Reset of all peripherals */
+    HAL_Init();
+
+    /* Configure the system clock */
+    SystemClock_Config();
+
+    /* Initialize all configured peripherals */
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_I2C1_Init();
+    MX_SPI1_Init();
+    MX_TIM4_Init();
+    MX_TIM3_Init();
+    MX_USART2_UART_Init();
+    MX_FATFS_Init();
+    MX_USB_DEVICE_Init();
+
+    /* Initialize hardware components */
+    
+    // USB CDC 디버깅 초기화
+    Debug_Init();
+    
+    // DHT22 초기화
+    DHT22_Init(GPIOC, GPIO_PIN_13);
+    DEBUG_INFO("DHT22 initialized on PC13\r\n");
+    
+    // BME280 초기화
+    HAL_Delay(100);
+    if (!BME280_Init(&hi2c1)) {
+        DEBUG_ERROR("BME280 initialization failed!\r\n");
+    } else {
+        DEBUG_INFO("BME280 initialized successfully\r\n");
+    }
+    
+    // OLED 초기화
+    HAL_Delay(100);
+    if (SSD1306_Init(&hi2c1) == SSD1306_OK) {
+        DisplayInitScreen();
+        DEBUG_INFO("OLED initialized successfully\r\n");
+    } else {
+        DEBUG_ERROR("OLED initialization failed!\r\n");
+    }
+    
+    // WS2812B 초기화
+    WS2812B_Init();
+    DEBUG_INFO("WS2812B initialized\r\n");
+    
+    // 모든 LED 끄기
+    memset(tempLeds, 0, sizeof(tempLeds));
+    memset(humidityLeds, 0, sizeof(humidityLeds));
+    WS2812B_SetData(&htim4, TIM_CHANNEL_1, tempLeds, TEMP_LED_COUNT);
+    WS2812B_SetData(&htim3, TIM_CHANNEL_3, humidityLeds, HUMIDITY_LED_COUNT);
+    DEBUG_INFO("LEDs cleared\r\n");
+    
+    // ESP01 초기화
+    HAL_Delay(500);
+    if (!ESP01_Init()) {
+        DEBUG_ERROR("ESP01 initialization failed!\r\n");
+    } else {
+        DEBUG_INFO("ESP01 initialized successfully\r\n");
+    }
+    
+    // 초기 센서 읽기
+    UpdateSensors();
+    DEBUG_INFO("System initialization completed\r\n");
+
+    /* Infinite loop */
+    uint32_t loopCount = 0;
+    while (1)
+    {
+        uint32_t currentTick = GetTick();
+        loopCount++;
+        
+        // 센서 데이터 업데이트 (1초마다)
+        if (currentTick - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
+            UpdateSensors();
+            lastSensorUpdate = currentTick;
+        }
+        
+        // 디스플레이 업데이트 (2초마다)
+        if (currentTick - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
+            UpdateDisplay();
+            lastDisplayUpdate = currentTick;
+        }
+        
+        // LED 업데이트 (0.5초마다)
+        if (currentTick - lastLedUpdate >= LED_UPDATE_INTERVAL) {
+            UpdateLEDs();
+            lastLedUpdate = currentTick;
+        }
+        
+        // WiFi 상태 확인 (10초마다)
+        if (currentTick - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
+            CheckWiFi();
+            lastWiFiCheck = currentTick;
+        }
+        
+        // 웹 요청 처리 (항상)
+        if (server_active) {
+            ProcessWebRequests();
+        }
+        
+        // 시스템 상태 출력 (30초마다)
+        if (loopCount % 3000 == 0) {
+            DEBUG_INFO("Status - Loop:%lu, Time:%lus, ESP01:%d, Sensor:%s\r\n",
+                      loopCount, currentTick/1000, esp01_state, 
+                      currentSensorData.valid ? "OK" : "ERR");
+        }
+        
+        // 짧은 지연
+        HAL_Delay(10);
+    }
+}
+
+/**
+  * @brief  센서 데이터 업데이트
+  */
+void UpdateSensors(void)
+{
+    SensorData_t newData = {0};
+    bool bmeSuccess = false;
+    bool dhtSuccess = false;
+    
+    // BME280 읽기
+    bmeSuccess = ReadBME280(&newData);
+    if (bmeSuccess) {
+        DEBUG_LOG("BME280: T=%.1fC, H=%.1f%%\r\n", 
+                  newData.temperature, newData.humidity);
+    }
+    
+    if (bmeSuccess) {
+        // DHT22로 검증
+        SensorData_t dhtData = {0};
+        dhtSuccess = ReadDHT22(&dhtData);
+        
+        if (dhtSuccess) {
+            newData.temperature = (newData.temperature + dhtData.temperature) / 2.0f;
+            newData.humidity = (newData.humidity + dhtData.humidity) / 2.0f;
+        }
+    } else {
+        dhtSuccess = ReadDHT22(&newData);
+        newData.pressure = 0.0f;
+    }
+    
+    if (bmeSuccess || dhtSuccess) {
+        newData.timestamp = GetTick();
+        newData.valid = true;
+        currentSensorData = newData;
+    } else {
+        currentSensorData.valid = false;
+    }
+}
+
+/**
+  * @brief  디스플레이 업데이트
+  */
+void UpdateDisplay(void)
+{
+    DisplaySensorData();
+}
+
+/**
+  * @brief  LED 업데이트
+  */
+void UpdateLEDs(void)
+{
+    if (currentSensorData.valid) {
+        UpdateTemperatureLEDs(currentSensorData.temperature);
+        UpdateHumidityLEDs(currentSensorData.humidity);
+    } else {
+        // 센서 오류 시 빨간 LED 깜박임
+        static bool errorBlink = false;
+        errorBlink = !errorBlink;
+        
+        for (int i = 0; i < TEMP_LED_COUNT; i++) {
+            tempLeds[i].red = (errorBlink && i == 0) ? 50 : 0;
+            tempLeds[i].green = 0;
+            tempLeds[i].blue = 0;
+        }
+        WS2812B_SetData(&htim4, TIM_CHANNEL_1, tempLeds, TEMP_LED_COUNT);
+        
+        for (int i = 0; i < HUMIDITY_LED_COUNT; i++) {
+            humidityLeds[i].red = (errorBlink && i == 0) ? 50 : 0;
+            humidityLeds[i].green = 0;
+            humidityLeds[i].blue = 0;
+        }
+        WS2812B_SetData(&htim3, TIM_CHANNEL_3, humidityLeds, HUMIDITY_LED_COUNT);
+    }
+}
+
+/**
+  * @brief  WiFi 상태 확인
+  */
+void CheckWiFi(void)
+{
+    static ESP01_State_t lastState = ESP01_STATE_IDLE;
+    esp01_state = ESP01_GetState();
+    
+    switch (esp01_state) {
+        case ESP01_STATE_IDLE:
+            if (ESP01_ConnectWiFi(ESP01_SSID, ESP01_PASSWORD)) {
+                DEBUG_INFO("WiFi connection initiated\r\n");
+            }
+            break;
+            
+        case ESP01_STATE_CONNECTED:
+            if (lastState != ESP01_STATE_CONNECTED) {
+                DEBUG_INFO("WiFi connected!\r\n");
+            }
+            if (ESP01_StartServer(ESP01_SERVER_PORT)) {
+                server_active = true;
+                DEBUG_INFO("Web server started\r\n");
+            }
+            break;
+            
+        case ESP01_STATE_SERVER_READY:
+            if (lastState != ESP01_STATE_SERVER_READY) {
+                DEBUG_INFO("Server ready\r\n");
+                server_active = true;
+            }
+            break;
+            
+        case ESP01_STATE_ERROR:
+            DEBUG_WARN("ESP01 error - reconnecting\r\n");
+            server_active = false;
+            ESP01_Init();
+            break;
+    }
+    
+    lastState = esp01_state;
+}
+
+/**
+  * @brief  웹 요청 처리
+  */
+void ProcessWebRequests(void)
+{
+    ESP01_Process();
+}
+
+/**
+  * @brief  BME280 센서 읽기
+  */
+bool ReadBME280(SensorData_t *data)
+{
+    BME280_Data_t bmeData;
+    
+    if (BME280_Read(&bmeData) == BME280_OK) {
+        data->temperature = bmeData.temperature;
+        data->humidity = bmeData.humidity;
+        data->pressure = bmeData.pressure;
+        return true;
+    }
+    return false;
+}
+
+/**
+  * @brief  DHT22 센서 읽기
+  */
+bool ReadDHT22(SensorData_t *data)
+{
+    DHT22_Data_t dhtData;
+    
+    if (DHT22_Read(&dhtData) == DHT22_OK) {
+        data->temperature = dhtData.temperature;
+        data->humidity = dhtData.humidity;
+        data->pressure = 0.0f;
+        return true;
+    }
+    return false;
+}
+
+/**
+  * @brief  온도 LED 업데이트
+  */
+void UpdateTemperatureLEDs(float temp)
+{
+    int ledCount = (int)((temp + 10.0f) / 12.0f);
+    if (ledCount > TEMP_LED_COUNT) ledCount = TEMP_LED_COUNT;
+    if (ledCount < 0) ledCount = 0;
+    
+    uint32_t color = TemperatureToColor(temp);
+    
+    for (int i = 0; i < TEMP_LED_COUNT; i++) {
+        if (i < ledCount) {
+            tempLeds[i].red = (color >> 16) & 0xFF;
+            tempLeds[i].green = (color >> 8) & 0xFF;
+            tempLeds[i].blue = color & 0xFF;
+        } else {
+            tempLeds[i].red = 0;
+            tempLeds[i].green = 0;
+            tempLeds[i].blue = 0;
+        }
+    }
+    
+    WS2812B_SetData(&htim4, TIM_CHANNEL_1, tempLeds, TEMP_LED_COUNT);
+}
+
+/**
+  * @brief  습도 LED 업데이트
+  */
+void UpdateHumidityLEDs(float humidity)
+{
+    int ledCount = (int)(humidity / 20.0f);
+    if (ledCount > HUMIDITY_LED_COUNT) ledCount = HUMIDITY_LED_COUNT;
+    if (ledCount < 0) ledCount = 0;
+    
+    uint32_t color = HumidityToColor(humidity);
+    
+    for (int i = 0; i < HUMIDITY_LED_COUNT; i++) {
+        if (i < ledCount) {
+            humidityLeds[i].red = (color >> 16) & 0xFF;
+            humidityLeds[i].green = (color >> 8) & 0xFF;
+            humidityLeds[i].blue = color & 0xFF;
+        } else {
+            humidityLeds[i].red = 0;
+            humidityLeds[i].green = 0;
+            humidityLeds[i].blue = 0;
+        }
+    }
+    
+    WS2812B_SetData(&htim3, TIM_CHANNEL_3, humidityLeds, HUMIDITY_LED_COUNT);
+}
+
+/**
+  * @brief  온도 색상 변환
+  */
+uint32_t TemperatureToColor(float temp)
+{
+    if (temp < 10.0f) return 0x0080FF;
+    else if (temp < 20.0f) return 0x00FFFF;
+    else if (temp < 25.0f) return 0x00FF00;
+    else if (temp < 30.0f) return 0xFFFF00;
+    else if (temp < 35.0f) return 0xFF8000;
+    else return 0xFF0000;
+}
+
+/**
+  * @brief  습도 색상 변환
+  */
+uint32_t HumidityToColor(float humidity)
+{
+    if (humidity < 30.0f) return 0xFF4000;
+    else if (humidity < 40.0f) return 0xFFFF00;
+    else if (humidity < 60.0f) return 0x00FF00;
+    else if (humidity < 80.0f) return 0x00FFFF;
+    else return 0x0080FF;
+}
+
+/**
+  * @brief  LED 상태 제어
+  */
+void SetLEDState(bool state)
+{
+    ledState = state;
+}
+
+/**
+  * @brief  초기화 화면 표시
+  */
+void DisplayInitScreen(void)
+{
+    SSD1306_Clear();
+    SSD1306_GotoXY(10, 5);
+    SSD1306_Puts("STM32F411", &Font_11x18, SSD1306_COLOR_WHITE);
+    SSD1306_GotoXY(15, 25);
+    SSD1306_Puts("IoT Dashboard", &Font_7x10, SSD1306_COLOR_WHITE);
+    SSD1306_GotoXY(20, 40);
+    SSD1306_Puts("Initializing...", &Font_7x10, SSD1306_COLOR_WHITE);
+    SSD1306_UpdateScreen();
+}
+
+/**
+  * @brief  센서 데이터 표시
+  */
+void DisplaySensorData(void)
+{
+    char buffer[32];
+    
+    SSD1306_Clear();
+    
+    // WiFi 상태
+    SSD1306_GotoXY(0, 0);
+    if (esp01_state == ESP01_STATE_SERVER_READY) {
+        SSD1306_Puts("WiFi: Ready", &Font_7x10, SSD1306_COLOR_WHITE);
+    } else {
+        SSD1306_Puts("WiFi: Connecting", &Font_7x10, SSD1306_COLOR_WHITE);
+    }
+    
+    if (currentSensorData.valid) {
+        SSD1306_GotoXY(0, 15);
+        sprintf(buffer, "Temp: %.1fC", currentSensorData.temperature);
+        SSD1306_Puts(buffer, &Font_7x10, SSD1306_COLOR_WHITE);
+        
+        SSD1306_GotoXY(0, 25);
+        sprintf(buffer, "Humi: %.1f%%", currentSensorData.humidity);
+        SSD1306_Puts(buffer, &Font_7x10, SSD1306_COLOR_WHITE);
+        
+        if (currentSensorData.pressure > 0) {
+            SSD1306_GotoXY(0, 35);
+            sprintf(buffer, "Pres: %.0fhPa", currentSensorData.pressure / 100.0f);
+            SSD1306_Puts(buffer, &Font_7x10, SSD1306_COLOR_WHITE);
+        }
+    } else {
+        SSD1306_GotoXY(0, 15);
+        SSD1306_Puts("Sensor: Error", &Font_7x10, SSD1306_COLOR_WHITE);
+    }
+    
+    SSD1306_GotoXY(0, 45);
+    sprintf(buffer, "LED: %s", ledState ? "ON" : "OFF");
+    SSD1306_Puts(buffer, &Font_7x10, SSD1306_COLOR_WHITE);
+    
+    SSD1306_UpdateScreen();
+}
+
+/* ESP01 AT 명령어 함수들 */
+
+/**
+  * @brief  ESP01 초기화
+  */
+bool ESP01_Init(void)
+{
+    DEBUG_INFO("ESP01: Initializing...\r\n");
+    
+    // UART DMA 수신 시작
+    HAL_UART_Receive_DMA(&huart2, (uint8_t*)esp01_rx_buffer, ESP01_BUFFER_SIZE);
+    
+    // ESP01 리셋
+    if (!ESP01_SendCommand("AT+RST", "ready", 10000)) {
+        DEBUG_ERROR("ESP01: Reset failed\r\n");
+        return false;
+    }
+    
+    HAL_Delay(2000);
+    
+    // AT 테스트
+    if (!ESP01_SendCommand("AT", "OK", 1000)) {
+        DEBUG_ERROR("ESP01: AT test failed\r\n");
+        return false;
+    }
+    
+    // Echo 끄기
+    ESP01_SendCommand("ATE0", "OK", 1000);
+    
+    // WiFi 모드 설정
+    if (!ESP01_SendCommand("AT+CWMODE=1", "OK", 2000)) {
+        DEBUG_ERROR("ESP01: Mode setup failed\r\n");
+        return false;
+    }
+    
+    esp01_state = ESP01_STATE_IDLE;
+    DEBUG_INFO("ESP01: Initialized\r\n");
+    return true;
+}
+
+/**
+  * @brief  WiFi 연결
+  */
+bool ESP01_ConnectWiFi(const char* ssid, const char* password)
+{
+    char cmd[128];
+    
+    DEBUG_INFO("ESP01: Connecting to %s\r\n", ssid);
+    esp01_state = ESP01_STATE_CONNECTING;
+    
+    // 기존 연결 해제
+    ESP01_SendCommand("AT+CWQAP", "OK", 2000);
+    
+    // WiFi 연결
+    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", ssid, password);
+    
+    if (!ESP01_SendCommand(cmd, "OK", 20000)) {
+        DEBUG_ERROR("ESP01: Connection failed\r\n");
+        esp01_state = ESP01_STATE_ERROR;
+        return false;
+    }
+    
+    // IP 확인
+    if (ESP01_SendCommand("AT+CIFSR", "OK", 3000)) {
+        DEBUG_INFO("ESP01: Connected\r\n");
+        esp01_state = ESP01_STATE_CONNECTED;
+        return true;
+    }
+    
+    esp01_state = ESP01_STATE_ERROR;
+    return false;
+}
+
+/**
+  * @brief  TCP 서버 시작
+  */
+bool ESP01_StartServer(uint16_t port)
+{
+    char cmd[64];
+    
+    DEBUG_INFO("ESP01: Starting server on port %d\r\n", port);
+    
+    // 다중 연결 활성화
+    if (!ESP01_SendCommand("AT+CIPMUX=1", "OK", 2000)) {
+        DEBUG_ERROR("ESP01: CIPMUX failed\r\n");
+        return false;
+    }
+    
+    // 서버 시작
+    snprintf(cmd, sizeof(cmd), "AT+CIPSERVER=1,%d", port);
+    if (!ESP01_SendCommand(cmd, "OK", 3000)) {
+        DEBUG_ERROR("ESP01: Server start failed\r\n");
+        return false;
+    }
+    
+    // 타임아웃 설정
+    ESP01_SendCommand("AT+CIPSTO=180", "OK", 2000);
+    
+    esp01_state = ESP01_STATE_SERVER_READY;
+    DEBUG_INFO("ESP01: Server ready\r\n");
+    return true;
+}
+
+/**
+  * @brief  HTTP 응답 전송
+  */
+bool ESP01_SendResponse(uint8_t link_id, const char* response)
+{
+    char cmd[64];
+    uint16_t len = strlen(response);
+    
+    // 전송 준비
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%d", link_id, len);
+    if (!ESP01_SendCommand(cmd, ">", 2000)) {
+        return false;
+    }
+    
+    // 데이터 전송
+    HAL_UART_Transmit(&huart2, (uint8_t*)response, len, 3000);
+    HAL_Delay(100);
+    
+    // 연결 종료
+    snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE=%d", link_id);
+    ESP01_SendCommand(cmd, "OK", 1000);
+    
+    return true;
+}
+
+/**
+  * @brief  HTTP 요청 처리
+  */
+void ESP01_Process(void)
+{
+    if (!esp01_response_received) return;
+    
+    esp01_response_received = false;
+    
+    // +IPD 확인
+    char* ipd_pos = strstr(esp01_rx_buffer, "+IPD");
+    if (ipd_pos == NULL) {
+        ESP01_ClearBuffer();
+        return;
+    }
+    
+    // Link ID 추출
+    uint8_t link_id = 0;
+    sscanf(ipd_pos, "+IPD,%hhu", &link_id);
+    
+    DEBUG_LOG("ESP01: Request on link %d\r\n", link_id);
+    
+    // HTTP 요청 처리
+    if (strstr(esp01_rx_buffer, "GET /sensors") != NULL) {
+        // 센서 데이터 JSON
+        char response[512];
+        snprintf(response, sizeof(response),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"temperature\":%.1f,\"humidity\":%.1f,\"pressure\":%.0f}",
+            currentSensorData.temperature,
+            currentSensorData.humidity,
+            currentSensorData.pressure
+        );
+        ESP01_SendResponse(link_id, response);
+        DEBUG_INFO("Sent sensor data\r\n");
+        
+    } else if (strstr(esp01_rx_buffer, "GET /led/on") != NULL) {
+        SetLEDState(true);
+        ESP01_SendResponse(link_id, 
+            "HTTP/1.1 200 OK\r\n"
+            "Connection: close\r\n\r\n"
+            "LED ON");
+        DEBUG_INFO("LED ON\r\n");
+        
+    } else if (strstr(esp01_rx_buffer, "GET /led/off") != NULL) {
+        SetLEDState(false);
+        ESP01_SendResponse(link_id,
+            "HTTP/1.1 200 OK\r\n"
+            "Connection: close\r\n\r\n"
+            "LED OFF");
+        DEBUG_INFO("LED OFF\r\n");
+        
+    } else if (strstr(esp01_rx_buffer, "GET /") != NULL) {
+        // 메인 페이지
+        const char* html = 
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Connection: close\r\n\r\n"
+            "<html><head><meta charset='UTF-8'><title>STM32 IoT</title>"
+            "<style>body{font-family:Arial;text-align:center;padding:20px;}"
+            ".card{background:#f0f0f0;padding:20px;margin:15px;border-radius:10px;}"
+            ".btn{background:#4CAF50;color:white;padding:15px;border:none;border-radius:5px;cursor:pointer;margin:5px;}"
+            "</style></head><body>"
+            "<h1>STM32 IoT Dashboard</h1>"
+            "<div class='card'><h2>Temperature</h2><div id='temp'>--</div></div>"
+            "<div class='card'><h2>Humidity</h2><div id='humi'>--</div></div>"
+            "<div class='card'>"
+            "<button class='btn' onclick=\"fetch('/led/on')\">LED ON</button>"
+            "<button class='btn' onclick=\"fetch('/led/off')\" style='background:#f44'>LED OFF</button>"
+            "</div>"
+            "<script>"
+            "function update(){fetch('/sensors').then(r=>r.json()).then(d=>{"
+            "document.getElementById('temp').innerHTML=d.temperature+'°C';"
+            "document.getElementById('humi').innerHTML=d.humidity+'%';})}"
+            "setInterval(update,1000);update();"
+            "</script></body></html>";
+        ESP01_SendResponse(link_id, html);
+        DEBUG_INFO("Sent main page\r\n");
+    }
+    
+    ESP01_ClearBuffer();
+}
+
+/**
+  * @brief  ESP01 상태 반환
+  */
+ESP01_State_t ESP01_GetState(void)
+{
+    return esp01_state;
+}
+
+/**
+  * @brief  AT 명령어 전송
+  */
+static bool ESP01_SendCommand(const char* cmd, const char* expected, uint32_t timeout)
+{
+    ESP01_ClearBuffer();
+    
+    // 명령 전송
+    HAL_UART_Transmit(&huart2, (uint8_t*)cmd, strlen(cmd), 1000);
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 1000);
+    
+    #if ESP01_DEBUG_ENABLE
+    DEBUG_LOG("AT> %s\r\n", cmd);
+    #endif
+    
+    return ESP01_WaitForResponse(expected, timeout);
+}
+
+/**
+  * @brief  응답 대기
+  */
+static bool ESP01_WaitForResponse(const char* expected, uint32_t timeout)
+{
+    uint32_t start = HAL_GetTick();
+    
+    while ((HAL_GetTick() - start) < timeout) {
+        if (esp01_response_received || esp01_rx_index > 0) {
+            if (strstr(esp01_rx_buffer, expected) != NULL) {
+                #if ESP01_DEBUG_ENABLE
+                DEBUG_LOG("AT< OK (%s)\r\n", expected);
+                #endif
+                return true;
+            }
+        }
+        HAL_Delay(10);
+    }
+    
+    #if ESP01_DEBUG_ENABLE
+    DEBUG_WARN("AT timeout: %s\r\n", expected);
+    #endif
+    return false;
+}
+
+/**
+  * @brief  버퍼 클리어
+  */
+static void ESP01_ClearBuffer(void)
+{
+    memset(esp01_rx_buffer, 0, ESP01_BUFFER_SIZE);
+    esp01_rx_index = 0;
+    esp01_response_received = false;
+}
+
+/* USB CDC 디버깅 함수들 */
+
+/**
+  * @brief  디버깅 초기화
+  */
+void Debug_Init(void)
+{
+    HAL_Delay(2000);
+    usb_cdc_ready = true;
+    
+    DEBUG_INFO("\r\n=== STM32F411 IoT Dashboard ===\r\n");
+    DEBUG_INFO("System Clock: %lu MHz\r\n", HAL_RCC_GetSysClockFreq() / 1000000);
+    DEBUG_INFO("USB CDC Ready\r\n");
+}
+
+/**
+  * @brief  디버그 printf
+  */
+void Debug_Printf(debug_level_t level, const char* format, ...)
+{
+    if (!usb_cdc_ready || level > DEBUG_CURRENT_LEVEL) return;
+    
+    va_list args;
+    va_start(args, format);
+    
+    uint32_t timestamp = HAL_GetTick();
+    int prefix_len = 0;
+    
+    switch (level) {
+        case DEBUG_LEVEL_ERROR:
+            prefix_len = snprintf(debug_buffer, DEBUG_BUFFER_SIZE, "[%lu] ERR: ", timestamp);
+            break;
+        case DEBUG_LEVEL_WARN:
+            prefix_len = snprintf(debug_buffer, DEBUG_BUFFER_SIZE, "[%lu] WRN: ", timestamp);
+            break;
+        case DEBUG_LEVEL_INFO:
+            prefix_len = snprintf(debug_buffer, DEBUG_BUFFER_SIZE, "[%lu] INF: ", timestamp);
+            break;
+        case DEBUG_LEVEL_DEBUG:
+            prefix_len = snprintf(debug_buffer, DEBUG_BUFFER_SIZE, "[%lu] DBG: ", timestamp);
+            break;
+    }
+    
+    int msg_len = vsnprintf(debug_buffer + prefix_len, 
+                           DEBUG_BUFFER_SIZE - prefix_len, format, args);
+    va_end(args);
+    
+    int total_len = prefix_len + msg_len;
+    if (total_len >= DEBUG_BUFFER_SIZE) {
+        total_len = DEBUG_BUFFER_SIZE - 1;
+    }
+    
+    CDC_Transmit_FS((uint8_t*)debug_buffer, total_len);
+}
+
+/**
+  * @brief  printf 리다이렉션
+  */
+int _write(int file, char *ptr, int len)
+{
+    if (!usb_cdc_ready) return len;
+    
+    if (CDC_Transmit_FS((uint8_t*)ptr, len) == USBD_OK) {
+        return len;
+    }
+    return 0;
+}
+
+/**
+  * @brief  UART 수신 완료 콜백
+  */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        esp01_response_received = true;
+        HAL_UART_Receive_DMA(&huart2, (uint8_t*)esp01_rx_buffer, ESP01_BUFFER_SIZE);
+    }
+}
+
+/**
+  * @brief  틱 반환
+  */
+uint32_t GetTick(void)
+{
+    return HAL_GetTick();
+}
