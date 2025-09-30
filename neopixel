@@ -5,7 +5,6 @@
  * - 온도 LED: PB6 (TIM4_CH1) - WS2812B 5개
  * - 습도 LED: PB0 (TIM3_CH3) - WS2812B 5개  
  * - WiFi ESP01: PA2(TX), PA3(RX) - UART2
- * - DHT22: PC13
  * - OLED: PB8(SDA), PA8(SCL) - I2C1
  * - SD Card: PB9(CS), PA7(MOSI), PB3(SCK), PA6(MISO) - SPI1
  * - USB CDC: PA11(DM), PA12(DP) - 디버깅용
