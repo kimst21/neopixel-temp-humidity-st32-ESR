@@ -1,13 +1,22 @@
 /* STM32F411 IoT Dashboard - AT 명령어 방식 완성 코드
  * ESP01을 AT 명령어로 직접 제어
+ * System Clock: 96MHz
  * 
  * 핀 구성:
  * - 온도 LED: PB6 (TIM4_CH1) - WS2812B 5개
  * - 습도 LED: PB0 (TIM3_CH3) - WS2812B 5개  
  * - WiFi ESP01: PA2(TX), PA3(RX) - UART2
+ * - DHT22: PC13
  * - OLED: PB8(SDA), PA8(SCL) - I2C1
  * - SD Card: PB9(CS), PA7(MOSI), PB3(SCK), PA6(MISO) - SPI1
  * - USB CDC: PA11(DM), PA12(DP) - 디버깅용
+ * 
+ * Clock Configuration:
+ * - SYSCLK: 96MHz
+ * - AHB: 96MHz
+ * - APB1: 48MHz (TIM3, I2C1, USART2)
+ * - APB2: 96MHz (TIM4, SPI1)
+ * - USB: 48MHz
  */
 
 /* Includes ------------------------------------------------------------------*/
@@ -848,7 +857,9 @@ void Debug_Init(void)
     usb_cdc_ready = true;
     
     DEBUG_INFO("\r\n=== STM32F411 IoT Dashboard ===\r\n");
-    DEBUG_INFO("System Clock: %lu MHz\r\n", HAL_RCC_GetSysClockFreq() / 1000000);
+    DEBUG_INFO("System Clock: 96 MHz\r\n");
+    DEBUG_INFO("APB1: 48 MHz | APB2: 96 MHz\r\n");
+    DEBUG_INFO("USB: 48 MHz\r\n");
     DEBUG_INFO("USB CDC Ready\r\n");
 }
 
